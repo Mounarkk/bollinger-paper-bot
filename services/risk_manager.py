@@ -1,40 +1,33 @@
-# File: services/risk_manager.py
-
 class RiskManager:
     """
-    Validates trade signals based on risk management rules.
+    Decides how much to trade on each signal. It's very basic, there's no stop loss or anything like it.
+
+    A buy spends a fixed part of the cash, so several buy signals in a row keep adding to
+    the position. A sell closes everything. Orders worth less than min_notional are
+    skipped, Binance would refuse them anyway.
     """
 
-    def __init__(self, max_risk_per_trade: float = 0.02, min_trade_size: float = 0.001):
-        self.max_risk_per_trade = max_risk_per_trade
-        self.min_trade_size = min_trade_size
+    def __init__(self, trade_fraction: float = 0.02, min_notional: float = 10.0):
+        self.trade_fraction = trade_fraction
+        self.min_notional = min_notional
 
-    def validate_signal(self, portfolio, signal: int, price: float, symbol: str) -> bool:
-        """
-        Validate whether a trade signal adheres to risk management rules.
+    def size_order(self, portfolio, signal: int, price: float, symbol: str, fee_rate: float = 0.0) -> float:
+        """Quantity to trade, or 0 to skip the signal."""
+        if price <= 0:
+            return 0.0
 
-        Parameters:
-            portfolio (Portfolio): The portfolio object to check positions.
-            signal (int): Trade signal (1 for BUY, -1 for SELL).
-            price (float): Current asset price.
-            symbol (str): Trading pair.
+        if signal == 1:
+            quantity = portfolio.balance * self.trade_fraction / price
+            if quantity * price < self.min_notional:
+                return 0.0
+            if quantity * price * (1 + fee_rate) > portfolio.balance:
+                return 0.0
+            return quantity
 
-        Returns:
-            bool: True if the trade is valid, False otherwise.
-        """
-        position_size = portfolio.balance * self.max_risk_per_trade
-        quantity = position_size / price if price > 0 else 0
+        if signal == -1:
+            quantity = portfolio.get_position_quantity(symbol)
+            if quantity * price < self.min_notional:
+                return 0.0
+            return quantity
 
-        if signal == 1:  # BUY
-            if quantity < self.min_trade_size:
-                print(f"[WARNING] Trade size ({quantity:.6f}) is below the minimum trade size.")
-                return False
-            return True
-
-        elif signal == -1:  # SELL
-            open_quantity = portfolio.get_position_quantity(symbol)
-            if open_quantity == 0:
-                print(f"[WARNING] No open position to SELL for {symbol}.")
-                return False
-            return True
-
+        return 0.0

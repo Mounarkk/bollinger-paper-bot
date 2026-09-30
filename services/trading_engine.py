@@ -1,9 +1,27 @@
-# File: services/trading_engine.py
+import logging
+from dataclasses import dataclass
+
+import pandas as pd
+
+from services.metrics import summarize
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BacktestResult:
+    symbol: str
+    data: pd.DataFrame
+    signals: pd.Series
+    trades: list
+    equity: pd.Series  # account value at each candle close
+    metrics: dict
+    final_balance: float  # cash only, open positions aren't counted
+
 
 class TradingEngine:
-    """
-    Orchestrates the trading workflow.
-    """
+    """Connects the data, the strategy, the risk manager, the execution and the portfolio."""
+
     def __init__(self, data_handler, strategy, risk_manager, execution_manager, portfolio):
         self.data_handler = data_handler
         self.strategy = strategy
@@ -11,49 +29,43 @@ class TradingEngine:
         self.execution_manager = execution_manager
         self.portfolio = portfolio
 
-    def paper_run(self, symbol: str, interval: str):
-        """
-        Run the trading workflow.
-        """
-        print(f"[INFO] Starting trading engine for {symbol}, Interval: {interval}")
+    def process_signal(self, signal: int, symbol: str, price: float, timestamp=None):
+        """Makes a trade from a signal if the risk manager agrees. Used by the backtest and the live runner."""
+        quantity = self.risk_manager.size_order(
+            self.portfolio, signal, price, symbol, fee_rate=self.execution_manager.fee_rate
+        )
+        if quantity <= 0:
+            return None
+        return self.execution_manager.execute_trade(
+            signal, symbol, quantity, price, self.portfolio, timestamp=timestamp
+        )
 
-        # Step 1: Fetch historical or real-time data
-        data = self.data_handler.get_historical_data(symbol, interval, "2024-11-01")
+    def backtest(self, symbol: str, interval: str, start: str, end: str = None) -> BacktestResult:
+        data = self.data_handler.get_historical_data(symbol, interval, start, end)
+        if data.empty:
+            raise ValueError(f"No data for {symbol} {interval} between {start} and {end or 'now'}")
+        return self.run_backtest(data, symbol)
 
-        # Step 2: Generate signals
+    def run_backtest(self, data: pd.DataFrame, symbol: str) -> BacktestResult:
+        """
+        A candle's signal is only known once the candle has closed, so the trade happens at
+        the open of the next one. A signal on the very last candle is never traded.
+        """
+        logger.info("Backtesting %s over %d candles (%s to %s)", symbol, len(data), data.index[0], data.index[-1])
         signals = self.strategy.generate_signals(data)
 
-        # FIX: Iterate up to len(signals) - 1 because we execute on the NEXT candle
-        for i in range(len(signals) - 1):
-            signal = signals.iloc[i]
-            
-            # We execute at the OPEN price of the NEXT candle (i+1)
-            # This simulates reality: you get the signal at Close of i, and buy at Open of i+1
-            execution_price = data['open'].iloc[i + 1]
+        trades = []
+        equity = []
+        pending_signal = 0
+        for timestamp, candle in data.iterrows():
+            if pending_signal != 0:
+                trade = self.process_signal(pending_signal, symbol, candle["open"], timestamp)
+                if trade:
+                    trades.append(trade)
+            equity.append(self.portfolio.equity({symbol: candle["close"]}))
+            pending_signal = signals.loc[timestamp]
 
-            # Step 3: Validate trade using Risk Manager
-            position_size = self.portfolio.balance * self.risk_manager.max_risk_per_trade
-            quantity = position_size / execution_price if execution_price > 0 else 0
-
-            is_valid_trade = self.risk_manager.validate_signal(
-                portfolio=self.portfolio,
-                signal=signal,
-                price=execution_price,
-                symbol=symbol
-            )
-
-            if is_valid_trade:
-                # Step 4: Execute trade
-                self.execution_manager.execute_trade(
-                    signal=signal,
-                    symbol=symbol,
-                    quantity=quantity,
-                    price=execution_price,
-                    portfolio=self.portfolio
-                )
-
-                # Step 5: Update Portfolio
-                trade_value = quantity * execution_price
-                self.portfolio.balance += (-trade_value if signal == 1 else trade_value)
-
-        print(f"[INFO] Trading session complete. Portfolio: {self.portfolio}")
+        equity = pd.Series(equity, index=data.index, name="equity")
+        metrics = summarize(equity, trades, data["close"])
+        logger.info("Backtest done. %s", self.portfolio)
+        return BacktestResult(symbol, data, signals, trades, equity, metrics, self.portfolio.balance)

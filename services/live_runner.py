@@ -1,118 +1,99 @@
-# File: services/live_runner.py
-
-import time
 import json
+import logging
+import os
 import signal
-from datetime import datetime
-from utils.logger import get_logger
+import threading
+from datetime import UTC, datetime
+
+import pandas as pd
+
+from services.portfolio import Portfolio
+
+logger = logging.getLogger(__name__)
+
 
 class LiveRunner:
     """
-    Runs the trading engine live in paper trading mode.
+    Paper trading on live data. Every poll_seconds it checks if a new candle has closed,
+    and if so it trades on that candle's signal at its close price. Each candle is only
+    traded once. The portfolio is saved to recovery_file after every candle and loaded
+    back on start.
     """
-    def __init__(self, trading_engine, recovery_file="state.json", interval=60):
-        """
-        Initialize the live runner.
-
-        Parameters:
-            trading_engine (TradingEngine): The trading engine instance.
-            recovery_file (str): Path to the recovery state file.
-            interval (int): Time interval between runs in seconds.
-        """
+    def __init__(self, trading_engine, recovery_file="state.json", poll_seconds=60):
         self.trading_engine = trading_engine
         self.recovery_file = recovery_file
-        self.interval = interval
-        self.logger = get_logger("LiveRunner")
-        self.running = True
+        self.poll_seconds = poll_seconds
+        self.last_candle = None
+        self._stop = threading.Event()
 
-        # Load recovery state
-        self.recovery_state = self._load_recovery_state()
-
-        # Register signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self._shutdown_handler)
-        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        self._load_recovery_state()
 
     def _load_recovery_state(self):
-        """
-        Load the recovery state from the file.
-        """
         try:
-            with open(self.recovery_file, "r") as file:
+            with open(self.recovery_file) as file:
                 state = json.load(file)
-                self.logger.info(f"Recovery state loaded: {state}")
-                return state
+            portfolio = Portfolio.from_dict(state["portfolio"])
         except FileNotFoundError:
-            self.logger.warning("No recovery state found, starting fresh.")
-            return {}
-        except Exception as e:
-            self.logger.error(f"Failed to load recovery state: {e}")
-            return {}
+            logger.info("No saved state, starting fresh")
+            return
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise RuntimeError(f"Could not read {self.recovery_file}, fix or delete it ({e!r})") from e
+
+        self.trading_engine.portfolio = portfolio
+        if state.get("last_candle"):
+            self.last_candle = pd.Timestamp(state["last_candle"])
+        logger.info("Saved state loaded. %s", self.trading_engine.portfolio)
 
     def _save_recovery_state(self):
-        """
-        Save the recovery state to a file.
-        """
         state = {
-            "portfolio_balance": self.trading_engine.portfolio.balance,
-            "positions": self.trading_engine.portfolio.positions,
-            "last_run": datetime.utcnow().isoformat()
+            "portfolio": self.trading_engine.portfolio.to_dict(),
+            "last_candle": self.last_candle.isoformat() if self.last_candle is not None else None,
+            "last_run": datetime.now(UTC).isoformat(),
         }
-        try:
-            with open(self.recovery_file, "w") as file:
-                json.dump(state, file, indent=4)
-                self.logger.info("Recovery state saved.")
-        except Exception as e:
-            self.logger.error(f"Failed to save recovery state: {e}")
+        # write a temp file then rename it, so a crash in the middle can't leave a broken file
+        tmp_file = f"{self.recovery_file}.tmp"
+        with open(tmp_file, "w") as file:
+            json.dump(state, file, indent=4)
+        os.replace(tmp_file, self.recovery_file)
 
     def _shutdown_handler(self, signum, frame):
-        """
-        Handle shutdown signals for graceful exit.
-        """
-        self.logger.info("Shutdown signal received. Stopping live runner...")
-        self.running = False
+        logger.info("Stopping...")
+        self._stop.set()
+
+    def step(self, symbol: str, interval: str):
+        """Trades on the last closed candle if it's a new one. Returns the trade, or None."""
+        engine = self.trading_engine
+        data = engine.data_handler.get_recent_klines(symbol, interval, lookback=engine.strategy.lookback)
+        if data.empty:
+            return None
+
+        candle_time = data.index[-1]
+        if self.last_candle is not None and candle_time <= self.last_candle:
+            return None  # same candle as last time
+
+        latest_signal = int(engine.strategy.generate_signals(data).iloc[-1])
+        price = data["close"].iloc[-1]
+        trade = engine.process_signal(latest_signal, symbol, price, candle_time)
+
+        self.last_candle = candle_time
+        if trade:
+            logger.info("%s %.6f %s at %.2f (fee %.2f)", trade.side, trade.quantity, symbol, price, trade.fee)
+        logger.info("Candle %s UTC closed at %.2f, signal %d. %s", candle_time, price, latest_signal, engine.portfolio)
         self._save_recovery_state()
+        return trade
 
-    def run(self, symbol, interval):
-        """
-        Run the live trading loop.
-        """
-        self.logger.info("Starting live trading...")
-        lookback = 20
-
-        while self.running:
-            try:
-                # Step 1: Fetch live data
-                data = self.trading_engine.data_handler.get_recent_klines(symbol, interval, lookback=lookback)
-
-                # Step 2: Generate signals
-                signals = self.trading_engine.strategy.generate_signals(data)
-                
-                # FIX: Only process the most recent signal (the just-closed candle)
-                latest_signal = signals.iloc[-1]
-                current_price = data['close'].iloc[-1]
-
-                # Step 3: Validate trade
-                if self.trading_engine.risk_manager.validate_signal(
-                        self.trading_engine.portfolio, latest_signal, current_price, symbol
-                ):
-                    # Calculate quantity
-                    position_size = self.trading_engine.portfolio.balance * self.trading_engine.risk_manager.max_risk_per_trade
-                    quantity = position_size / current_price
-
-                    # Step 4: Execute trade
-                    self.trading_engine.execution_manager.execute_trade(
-                        latest_signal, symbol, quantity, current_price, self.trading_engine.portfolio
-                    )
-
-                # Log portfolio state after each loop
-                self.logger.info(f"Portfolio state: {self.trading_engine.portfolio}")
-
-                # Step 4: Save recovery state
-                self._save_recovery_state()
-
-                # Wait for the next run
-                time.sleep(self.interval)
-
-            except Exception as e:
-                self.logger.error(f"Error during live run: {e}")
-                time.sleep(self.interval)  # Wait before retrying
+    def run(self, symbol: str, interval: str):
+        logger.info("Starting live paper trading on %s %s", symbol, interval)
+        signal.signal(signal.SIGINT, self._shutdown_handler)
+        signal.signal(signal.SIGTERM, self._shutdown_handler)
+        try:
+            while not self._stop.is_set():
+                try:
+                    self.step(symbol, interval)
+                except Exception:
+                    # a network error shouldn't kill the loop, it just tries again next time
+                    logger.exception("Error during live run, retrying in %ss", self.poll_seconds)
+                self._stop.wait(self.poll_seconds)
+        finally:
+            self._save_recovery_state()
+            logger.info("Stopped. %s", self.trading_engine.portfolio)
