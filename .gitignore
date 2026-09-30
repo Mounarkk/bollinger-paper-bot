@@ -1,0 +1,22 @@
+# python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# keys
+.env
+.env.*
+!.env.example
+config.json
+*.pem
+*.key
+
+# created when the bot runs
+state.json
+application.log
+*.log
+
+# editors
+.idea/
+.vscode/
